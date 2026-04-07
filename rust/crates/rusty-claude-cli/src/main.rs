@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    OutputContentBlock, PromptCache, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -95,6 +95,60 @@ type RuntimePluginStateBuildOutput = (
     Vec<RuntimeToolDefinition>,
 );
 
+/// Load environment variables from the user's config file and apply them.
+/// This allows users to set API keys and other env vars in settings.json
+/// instead of relying on shell scripts or .env files.
+fn apply_env_from_config() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    
+    // Determine config home directory
+    let config_home = std::env::var_os("CLAW_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".claw"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".claw"));
+    
+    let settings_path = config_home.join("settings.json");
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    
+    // Read the settings file
+    let contents = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(e) => return Err(format!("Failed to read {}: {}", settings_path.display(), e).into()),
+    };
+    
+    // Parse as JSON
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("Failed to parse {}: {}", settings_path.display(), e).into()),
+    };
+    
+    // Extract the "env" object
+    let Some(env_obj) = value.get("env").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    
+    // Apply each key-value pair as an environment variable
+    let mut applied = Vec::new();
+    for (key, value) in env_obj {
+        if let Some(str_value) = value.as_str() {
+            std::env::set_var(key, str_value);
+            applied.push(key.clone());
+        }
+    }
+    
+    if !applied.is_empty() {
+        eprintln!("[config] Applied {} environment variable(s) from {}", applied.len(), settings_path.display());
+    }
+    
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
@@ -112,6 +166,9 @@ Run `claw --help` for usage."
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Load environment variables from config file early in startup
+    apply_env_from_config().ok();
+    
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests { output_format } => dump_manifests(output_format)?,
@@ -277,7 +334,13 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    // Try to load default model from config
+    let config_model = std::env::current_dir()
+        .ok()
+        .map(|cwd| runtime::ConfigLoader::default_for(&cwd).load())
+        .and_then(|config| config.ok())
+        .and_then(|config| config.model().map(String::from));
+    let mut model = config_model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -3113,12 +3176,13 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                // Ensure output ends with a newline before showing done marker
+                println!();
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
-                println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -3130,6 +3194,8 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                // Ensure output ends with a newline before showing fail marker
+                println!();
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -5571,7 +5637,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -5591,11 +5657,11 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resolved_model = resolve_model_alias(&model);
+        let client = ProviderClient::from_model(&resolved_model)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6550,10 +6616,13 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
+    // Prompt cache is only supported for Anthropic clients
+    if let ProviderClient::Anthropic(anthropic_client) = client {
+        if let Some(record) = anthropic_client.take_last_prompt_cache_record() {
+            if let Some(event) = prompt_cache_record_to_runtime_event(record) {
+                events.push(AssistantEvent::PromptCache(event));
+            }
         }
     }
 }
@@ -9059,6 +9128,109 @@ UU conflicted.rs",
         assert!(stderr.contains("failed to open browser automatically"));
         assert!(stderr.contains("Open this URL manually:"));
         assert!(stderr.contains("https://example.test/oauth/authorize"));
+    }
+
+    #[test]
+    fn apply_env_from_config_reads_and_sets_env_vars() {
+        use std::collections::BTreeMap;
+
+        let root = temp_dir();
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+
+        let settings = config_home.join("settings.json");
+        fs::write(
+            &settings,
+            r#"{"env":{"CLAW_TEST_VAR":"hello-from-config","CLAW_TEST_API_KEY":"sk-test-123"},"model":"claude-sonnet-4-6"}"#,
+        )
+        .expect("write settings");
+
+        let original_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_test_var = std::env::var("CLAW_TEST_VAR").ok();
+        let original_test_key = std::env::var("CLAW_TEST_API_KEY").ok();
+
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("CLAW_TEST_VAR");
+        std::env::remove_var("CLAW_TEST_API_KEY");
+
+        super::apply_env_from_config().expect("config apply should succeed");
+
+        assert_eq!(
+            std::env::var("CLAW_TEST_VAR").ok(),
+            Some("hello-from-config".to_string())
+        );
+        assert_eq!(
+            std::env::var("CLAW_TEST_API_KEY").ok(),
+            Some("sk-test-123".to_string())
+        );
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_test_var {
+            Some(value) => std::env::set_var("CLAW_TEST_VAR", value),
+            None => std::env::remove_var("CLAW_TEST_VAR"),
+        }
+        match original_test_key {
+            Some(value) => std::env::set_var("CLAW_TEST_API_KEY", value),
+            None => std::env::remove_var("CLAW_TEST_API_KEY"),
+        }
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn apply_env_from_config_silently_succeeds_when_no_settings_file() {
+        let root = temp_dir();
+        let config_home = root.join("empty-config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+
+        let original_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        let result = super::apply_env_from_config();
+        assert!(result.is_ok());
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn apply_env_from_config_ignores_non_string_values() {
+        let root = temp_dir();
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"env":{"CLAW_NUM_VAR":42,"CLAW_BOOL_VAR":true,"CLAW_STR_VAR":"only-this-gets-set"}}"#,
+        )
+        .expect("write settings with mixed types");
+
+        let original_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_str_var = std::env::var("CLAW_STR_VAR").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("CLAW_STR_VAR");
+
+        super::apply_env_from_config().expect("config apply should succeed");
+
+        assert_eq!(
+            std::env::var("CLAW_STR_VAR").ok(),
+            Some("only-this-gets-set".to_string())
+        );
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_str_var {
+            Some(value) => std::env::set_var("CLAW_STR_VAR", value),
+            None => std::env::remove_var("CLAW_STR_VAR"),
+        }
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

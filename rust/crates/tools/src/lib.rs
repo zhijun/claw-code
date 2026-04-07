@@ -4872,7 +4872,10 @@ fn config_home_dir() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
+    // Windows uses USERPROFILE, Unix uses HOME
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| String::from("HOME is not set"))?;
     Ok(PathBuf::from(home).join(".claw"))
 }
 

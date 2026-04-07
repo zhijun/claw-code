@@ -2599,7 +2599,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
         push_unique_root(
             &mut roots,
@@ -2708,7 +2708,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
         push_unique_skill_root(
             &mut roots,
@@ -2843,7 +2843,7 @@ fn default_skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         return Ok(PathBuf::from(home).join(".claw").join("skills"));
     }
     Err(std::io::Error::new(
